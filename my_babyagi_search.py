@@ -6,6 +6,7 @@ import pickle
 import re
 import subprocess
 import time
+from urllib.parse import quote
 
 import openai
 import pdfplumber
@@ -14,10 +15,13 @@ import urllib3
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from duckduckgo_search import ddg
+from googlesearch import SearchResult
 from selenium import webdriver
-from googlesearch import search
+
+import anthropic
 
 driver = webdriver.Chrome()
+driver.set_page_load_timeout(20)
 
 load_dotenv()
 
@@ -25,10 +29,11 @@ load_dotenv()
 
 # API Keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-assert OPENAI_API_KEY, "OPENAI_API_KEY environment variable is missing from .env"
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+assert OPENAI_API_KEY != "" or ANTHROPIC_API_KEY != "", "OPENAI_API_KEY and ANTHROPIC_API_KEY environment variable is missing from .env"
 
-OPENAI_API_MODEL = os.getenv("OPENAI_API_MODEL", "gpt-3.5-turbo")
-assert OPENAI_API_MODEL, "OPENAI_API_MODEL environment variable is missing from .env"
+API_MODEL = os.getenv("API_MODEL", "gpt-3.5-turbo")
+assert API_MODEL, "API_MODEL environment variable is missing from .env"
 
 # Goal configuation
 OBJECTIVE = os.getenv("OBJECTIVE", "")
@@ -44,7 +49,7 @@ ENABLE_COMMAND_LINE_ARGS = (
 if ENABLE_COMMAND_LINE_ARGS:
     from extensions.argparseext import parse_arguments
 
-    OBJECTIVE, INITIAL_TASK, OPENAI_API_MODEL, DOTENV_EXTENSIONS = parse_arguments()
+    OBJECTIVE, INITIAL_TASK, API_MODEL, DOTENV_EXTENSIONS = parse_arguments()
 
 # Load additional environment variables for enabled extensions
 if DOTENV_EXTENSIONS:
@@ -60,7 +65,7 @@ MAX_TOPICS = int(os.getenv("MAX_TOPICS"))
 MAX_QUERIES = int(os.getenv("MAX_QUERIES"))
 MAX_BROWSE = int(os.getenv("MAX_BROWSE"))
 MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS"))
-
+MAX_CHUNKS = int(os.getenv("MAX_CHUNKS"))
 
 url_cache = {}
 if os.path.exists('url_cache'):
@@ -75,44 +80,67 @@ if os.path.exists('openai_cache'):
     with open('openai_cache', 'rb') as f:
         openai_cache = pickle.load(f)
 
+token_counter = {'prompt': 0, 'completion': 0}
+
 def save_summaries(summaries):
     with open('summaries', 'wb') as f:
         pickle.dump(summaries, f)
 
 
+def get_url_from_google_cache(url):
+    try:
+        http = urllib3.PoolManager()
+        url = url.replace('http://', '').replace('https://', '')
+        cache_url = "https://webcache.googleusercontent.com/search?ie=UTF-8&q=cache:" + quote(url)
+        response = http.request("GET", cache_url)
+        if response.status == 200:
+            page_source = response.data
+            return page_source
+        else:
+            return None
+    except:
+        return None
+
+
 def get_url(url):
     if url in url_cache:
         return url_cache[url]
-    for a in range(3):
-        try:
+    try:
+        page_source = get_url_from_google_cache(url)
+        if page_source is None:
             driver.get(url)
             # Get the page source
             time.sleep(10)
             page_source = driver.page_source
-            # Parse the HTML with Beautiful Soup
-            soup = BeautifulSoup(page_source, 'html.parser')
-            # Extract the desired content using Beautiful Soup's methods
-            # Get the concatenated text of all elements, with optional separator and strip options
-            url_cache[url] = soup
-            with open('url_cache', 'wb') as f:
-                pickle.dump(url_cache, f)
-            return soup
-        except Exception as ex:
-            print(f"get_url '{url}'")
-            print('get_url', ex)
-            time.sleep(30)
-            continue
-    return ''
+        # Parse the HTML with Beautiful Soup
+        soup = BeautifulSoup(page_source, 'html.parser')
+        # Extract the desired content using Beautiful Soup's methods
+        # Get the concatenated text of all elements, with optional separator and strip options
+        url_cache[url] = soup
+        with open('url_cache', 'wb') as f:
+            pickle.dump(url_cache, f)
+        return soup
+    except Exception as ex:
+        print(f"get_url '{url}'")
+        print('get_url', ex)
+        time.sleep(30)
+        return ''
 
+MAX_PDF_PAGES = 10
 def read_pdf(url: str) -> str:
     http = urllib3.PoolManager()
     temp = io.BytesIO()
     temp.write(http.request("GET", url).data)
     with pdfplumber.open(temp) as pdf:
         text = ''
+        page_index = 0
         for page in pdf.pages:
             text += page.extract_text() + "\n"
+            page_index += 1
+            if page_index >= MAX_PDF_PAGES:
+                break
         return text
+
 
 def scrape_text(url):
     if url.lower().endswith(".pdf"):
@@ -158,7 +186,10 @@ def split_text(text):
 
     for paragraph in paragraphs:
         while count_tokens(paragraph) > MAX_TOKENS:
-            paragraph = paragraph[:len(paragraph) - 100]
+            if count_tokens(paragraph) > MAX_TOKENS * 2:
+                paragraph = paragraph[:len(paragraph)//2]
+            else:
+                paragraph = paragraph[:len(paragraph) - 100]
         if current_length + count_tokens(paragraph) + 1 <= MAX_TOKENS:
             current_chunk.append(paragraph)
             current_length += count_tokens(paragraph) + 1
@@ -190,7 +221,7 @@ def summarize_text(text, question):
         return text
 
     summaries = []
-    chunks = list(split_text(text))
+    chunks = list(split_text(text))[:MAX_CHUNKS]
 
     for i, chunk in enumerate(chunks):
         # print(f"Summarizing chunk {i + 1} / {len(chunks)}")
@@ -212,26 +243,50 @@ def summarize_text(text, question):
 
     return final_summary
 
+
 def google_search(query):
     if query in search_cache:
         return search_cache[query]
     search_results = []
 
-    #results = ddg(query)
-    results = search(query, advanced=True)
-    if results is None:
-        return []
+    # results = ddg(query)
+    results = []
+    for j in range(2):
+        try:
+            # results = search(query, advanced=True)
+            soup = get_url("https://www.google.com/search?q=" + quote(query))
 
-    for j in results:
-        search_results.append({'Url': j.url, 'Title': j.title})
+            result_block = soup.find_all("div", attrs={"class": "g"})
+            for result in result_block:
+                # Find link, title, description
+                link = result.find("a", href=True)
+                title = result.find("h3")
+                description_box = result.find(
+                    "div", {"style": "-webkit-line-clamp:2"})
+                if description_box:
+                    description = description_box.text
+                    if link and title and description:
+                        results.append(SearchResult(link["href"], title.text, description))
 
-    if len(search_results) == 0:
-        return []
+            if results is None:
+                return []
 
-    search_cache[query] = json.dumps(search_results, ensure_ascii=False, indent=4)
-    with open('search_cache', 'wb') as f:
-        pickle.dump(search_cache, f)
-    return search_cache[query]
+            for j in results:
+                search_results.append({'Url': j.url, 'Title': j.title})
+
+            if len(search_results) == 0:
+                return []
+
+            search_cache[query] = json.dumps(search_results, ensure_ascii=False, indent=4)
+            with open('search_cache', 'wb') as f:
+                pickle.dump(search_cache, f)
+            return search_cache[query]
+
+        except Exception as ex:
+            print(ex)
+            time.sleep(60)
+    return []
+
 
 def google_search_old(query, num_results=8):
     if query in search_cache:
@@ -275,18 +330,20 @@ def get_hyperlinks(url):
     return link_list
 
 
-
 def add_openai_cache(prompt, response):
     # print(f'Prompt: {prompt}\n\nResponse: {response}\n\n\n')
+    token_counter['prompt'] += count_tokens(prompt)
+    token_counter['completion'] += count_tokens(response)
     openai_cache[prompt] = response
     with open('openai_cache', 'wb') as f:
         pickle.dump(openai_cache, f)
     return response
 
 
+
 def openai_call(
         prompt: str,
-        model: str = OPENAI_API_MODEL,
+        model: str = API_MODEL,
         temperature: float = 0.5,
         max_tokens: int = 100,
 ):
@@ -295,7 +352,27 @@ def openai_call(
 
     while True:
         try:
-            if model.startswith("llama"):
+            if model.startswith("human"):
+                print('-' * 50 + '\n')
+                print(prompt)
+                response = ''
+                while True:
+                    x = input()
+                    if x.strip() == '':
+                        break
+                    response += x + '\n'
+                return add_openai_cache(prompt, response)
+            elif model.startswith("claude"):
+                client = anthropic.Client(ANTHROPIC_API_KEY)
+                response = client.completion(
+                    prompt=f"{anthropic.HUMAN_PROMPT}{prompt}{anthropic.AI_PROMPT}",
+                    stop_sequences=[anthropic.HUMAN_PROMPT],
+                    model=model,
+                    temperature=temperature,
+                    max_tokens_to_sample=max_tokens,
+                )
+                return add_openai_cache(prompt, response['completion'])
+            elif model.startswith("llama"):
                 # Spawn a subprocess to run llama.cpp
                 cmd = cmd = ["llama/main", "-p", prompt]
                 result = subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
@@ -333,9 +410,6 @@ def openai_call(
             break
 
 
-
-
-
 def count_tokens(text):
     encoding = tiktoken.encoding_for_model("gpt-3.5-turbo-0301")
     return len(encoding.encode(text))
@@ -364,7 +438,7 @@ def insert_prompt(prompt, params):
             length_per_value = length_per_value - 500
             if length_per_value <= 0:
                 raise Exception('insert_prompt: length_per_value<0 for prompt ' + prompt)
-    #if ret.find('{') != -1 or ret.find('}') != -1:
+    # if ret.find('{') != -1 or ret.find('}') != -1:
     #    print('WARNING! insert_prompt possible has unfilled variables', {'prompt': prompt, 'params': params, 'ret': ret})
     return ret
 
@@ -373,7 +447,8 @@ search_prompt = '''As a Search Agent, your task is to generate a list of queries
 for further investigation. Please create list of relevant
 queries for a web search engine, such as Google, that will help gather information on the specific topic.
 Please note that final task is {objective}.
-Critical: reply with list of search queries (no more than {max_queries}), each on a different line'''
+Critical: reply with list of search queries (no more than {max_queries}), each on a different line, without any comments.
+'''
 
 
 def get_search_queries(topic, objective):
@@ -391,7 +466,8 @@ decompose_prompt = '''As a Decomposition Agent, your task is to create a list of
 {objective}. Consider inputs from other agents: previous collected summaries {topic_summaries}. 
 Critics from the previous attempts: {critics}.
 Generate a comprehensive list of relevant topics that need to be explored further.
-Important: respond with only list of topics (max {max_topics}), each in separate line'''
+Important: respond with only list of topics (max {max_topics}), each in separate line.
+'''
 
 
 def split_tasks(text):
@@ -405,7 +481,8 @@ def decompose(objective, topic_summaries, critics, prev_topics):
         if critics != 'N/A':
             critics += f'\nPlease make sure to cover the new topics mentioned in critics. The topics {prev_topics} are already explored.'
         prompt = insert_prompt(decompose_prompt,
-                               {'objective': objective, 'topic_summaries': topic_summaries, 'critics': critics, 'max_topics': MAX_TOPICS})
+                               {'objective': objective, 'topic_summaries': topic_summaries, 'critics': critics,
+                                'max_topics': MAX_TOPICS})
         topics = openai_call(prompt).split('\n')
         topics = [x.strip() for x in topics]
         return [x for x in topics if x != '']
@@ -432,15 +509,15 @@ def get_filtered_results(objective, topic, search_results):
         prompt = insert_prompt(filtering_prompt,
                                {'objective': objective, 'topic': topic, 'search_results': search_results,
                                 'max_browse': MAX_BROWSE})
-        urls = openai_call(prompt).split('\n')
-        urls = [re.sub(pattern, '', x.strip()).strip() for x in urls]
+        urls = openai_call(prompt, max_tokens=200).split('\n')
+        urls = [re.sub(pattern, '', x.replace('#.', '').strip()).strip() for x in urls]
         return [x for x in urls if x != '' and x.startswith('http') and search_results.find(x) != -1]
     except Exception as ex:
         print(f'In get_filtered_results ERROR={ex}')
         return []
 
 
-browse_prompt = '''As a Browse Agent, your task is to view websites and retrieve information related to the specific
+browse_prompt = '''As a Browse Agent, your task is to retrieve information related to the specific
  topic of {topic} needed for the objective {objective}. Process the text below which is part of a website content retrieved
  with a query {query}, and provide a summary of the findings, including key insights, relevant details, and any noteworthy information related to 
  the topic. Important: please answer with a single `-` sign if the text is not relevant to the topic. Text:
@@ -451,7 +528,7 @@ browse_prompt = '''As a Browse Agent, your task is to view websites and retrieve
 def browse_and_summarize(url, query, topic, objective):
     try:
         text = scrape_text(url)
-        chunks = list(split_text(text))
+        chunks = list(split_text(text))[:MAX_CHUNKS]
         all = []
 
         for chunk in chunks:
@@ -479,7 +556,8 @@ is {objective}. Important: if information is missing in the results above, answe
 Please format your output as following:
 Thought: <your thoughts>
 Reasoning: <your reasoning>
-Answer: <final answer, may be up 2000 words, it will be passed to the higher level agent>'''
+Answer: <final answer, may be up 2000 words, it will be passed to the higher level agent>
+'''
 
 
 def summarize_topic(summaries, topic, objective):
@@ -505,7 +583,7 @@ is {objective}. Important: if information is missing in the results above, answe
 Please format your output as following:
 Thought: <your thoughts>
 Reasoning: <your reasoning>
-Answer: <final answer, may be up 1000 words, it will be passed to human>'''
+Answer: <final answer, may be up 2000 words, it will be passed to human>'''
 
 
 def create_final_answer(summaries, objective):
@@ -530,7 +608,7 @@ Agent's final answer: {final_answer}'''
 
 def critic_agent(final_answer, objective):
     text = openai_call(insert_prompt(critic_task_prompt,
-                                     {'objective': objective, 'final_answer': final_answer}), max_tokens=200)
+                                     {'objective': objective, 'final_answer': final_answer}), max_tokens=300)
     return text
 
 
@@ -577,8 +655,10 @@ for attempt in range(MAX_ATTEMPTS):
                 print(f'FILTERED URLS={filtered_results}')
                 for url in filtered_results[:MAX_BROWSE]:
                     if url not in summaries[topic]:
-                        summaries[topic][url] = browse_and_summarize(url, query, topic, OBJECTIVE)
-                        save_summaries(summaries)
+                        summary = browse_and_summarize(url, query, topic, OBJECTIVE)
+                        if summary != '':
+                            summaries[topic][url] = summary
+                            save_summaries(summaries)
 
         print(f'SUMMARIES={summaries[topic]}')
         if len(list(summaries[topic].values())) == 0:
@@ -601,4 +681,5 @@ for attempt in range(MAX_ATTEMPTS):
 
 save_summaries(summaries)
 
+print('TOKEN COUNTS', token_counter)
 print(f'FINAL_ANSWER={final_answer}')
