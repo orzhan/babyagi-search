@@ -17,10 +17,14 @@ from dotenv import load_dotenv
 from duckduckgo_search import ddg
 from googlesearch import SearchResult
 from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 
 import anthropic
 
-driver = webdriver.Chrome()
+options = Options()
+options.add_argument("--headless")
+
+driver = webdriver.Chrome(options=options)
 driver.set_page_load_timeout(20)
 
 load_dotenv()
