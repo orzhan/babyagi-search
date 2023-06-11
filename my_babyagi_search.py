@@ -20,6 +20,9 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
 import anthropic
+import uuid
+from revChatGPT.V1 import Chatbot
+
 
 options = Options()
 options.add_argument("--headless")
@@ -62,6 +65,7 @@ if DOTENV_EXTENSIONS:
     load_dotenv_extensions(DOTENV_EXTENSIONS)
 
 openai.api_key = OPENAI_API_KEY
+openai_chatgpt_access_token = os.getenv("OPENAI_CHATGPT_ACCESS_TOKEN", "")
 
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS"))
@@ -356,6 +360,17 @@ def openai_call(
 
     while True:
         try:
+            if model.startswith("chatgpt"):
+                chatbot = Chatbot(
+                    config={"access_token": openai_chatgpt_access_token, "model": "gpt-4"}
+                )
+                response = ""
+                time.sleep(30)
+                for data in chatbot.ask(prompt=prompt, auto_continue=True):
+                    if data["recipient"] != "all":
+                        continue
+                    response = data["message"]
+                return add_openai_cache(prompt, response)
             if model.startswith("human"):
                 print('-' * 50 + '\n')
                 print(prompt)
