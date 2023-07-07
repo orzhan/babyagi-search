@@ -22,7 +22,7 @@ from selenium.webdriver.chrome.options import Options
 import anthropic
 import uuid
 from revChatGPT.V1 import Chatbot
-
+import gpt4all
 
 options = Options()
 options.add_argument("--headless")
@@ -192,13 +192,17 @@ def split_text(text):
     current_length = 0
     current_chunk = []
 
+    max_tokens = MAX_TOKENS
+    if API_MODEL == "gpt_mix":
+        max_tokens = 15000
+
     for paragraph in paragraphs:
-        while count_tokens(paragraph) > MAX_TOKENS:
-            if count_tokens(paragraph) > MAX_TOKENS * 2:
+        while count_tokens(paragraph) > max_tokens:
+            if count_tokens(paragraph) > max_tokens * 2:
                 paragraph = paragraph[:len(paragraph)//2]
             else:
                 paragraph = paragraph[:len(paragraph) - 100]
-        if current_length + count_tokens(paragraph) + 1 <= MAX_TOKENS:
+        if current_length + count_tokens(paragraph) + 1 <= max_tokens:
             current_chunk.append(paragraph)
             current_length += count_tokens(paragraph) + 1
         else:
@@ -354,9 +358,17 @@ def openai_call(
         model: str = API_MODEL,
         temperature: float = 0.5,
         max_tokens: int = 100,
+        large_context: bool = False,
 ):
     if prompt in openai_cache:
         return openai_cache[prompt]
+
+    if model == "gpt_mix":
+        if large_context:
+            model = "gpt-3.5-turbo-16k"
+        else:
+            model = "gpt-4"
+
 
     while True:
         try:
@@ -396,6 +408,10 @@ def openai_call(
                 cmd = cmd = ["llama/main", "-p", prompt]
                 result = subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
                 return add_openai_cache(prompt, result.stdout.strip())
+            elif model.startswith("gpt4all"):
+                gptj = gpt4all.GPT4All("ggml-gpt4all-j-v1.3-groovy")
+                messages = [{"role": "user", "content": prompt}]
+                response = gptj.chat_completion(messages)
             elif not model.startswith("gpt-"):
                 # Use completion API
                 response = openai.Completion.create(
@@ -553,7 +569,7 @@ def browse_and_summarize(url, query, topic, objective):
         for chunk in chunks:
             prompt = insert_prompt(browse_prompt,
                                    {'objective': objective, 'topic': topic, 'query': query, 'search_results': chunk})
-            summary = openai_call(prompt).strip()
+            summary = openai_call(prompt, large_context=True).strip()
             if summary != '-':
                 all.append(summary)
 
